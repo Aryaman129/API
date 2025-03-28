@@ -72,7 +72,6 @@ def async_scraper(email, password):
         
         if not cookies:
             # If no cookies, login and get cookies
-            import requests
             
             # Get best scraper URL
             scraper_url = get_best_scraper()
