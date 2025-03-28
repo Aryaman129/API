@@ -8,6 +8,9 @@ from datetime import datetime, timedelta
 import os
 from dotenv import load_dotenv
 from supabase import create_client, Client
+import requests
+import random
+import json
 
 # Load environment variables
 load_dotenv()
@@ -22,6 +25,41 @@ app = Flask(__name__)
 CORS(app, origins=["https://academia-khaki.vercel.app", "http://localhost:3000"], supports_credentials=True, allow_headers=["Content-Type", "Authorization"])
 
 active_scrapers = {}
+
+def get_scraper_urls():
+    """Get list of all available scraper URLs from environment variable"""
+    default_scraper = "https://scraper-production-0be9.up.railway.app"
+    scraper_urls_str = os.getenv("SCRAPER_URLS", default_scraper)
+    return [url.strip() for url in scraper_urls_str.split(",")]
+
+def get_best_scraper():
+    """Select the best scraper based on health and availability"""
+    scraper_urls = get_scraper_urls()
+    
+    # Shuffle to distribute load
+    random.shuffle(scraper_urls)
+    
+    # Try to find a healthy scraper
+    healthy_scrapers = []
+    for url in scraper_urls:
+        try:
+            response = requests.get(f"{url}/health", timeout=3)
+            if response.ok:
+                response_time = response.elapsed.total_seconds()
+                healthy_scrapers.append((url, response_time))
+        except Exception:
+            # Skip scrapers that don't respond
+            continue
+    
+    if healthy_scrapers:
+        # Sort by response time (fastest first)
+        healthy_scrapers.sort(key=lambda x: x[1])
+        return healthy_scrapers[0][0]
+    
+    # If no healthy scrapers found, return the first one and hope for the best
+    if scraper_urls:
+        return scraper_urls[0]
+    return None
 
 def async_scraper(email, password):
     """Run scraper in background."""
@@ -480,34 +518,70 @@ def refresh_data():
         except jwt.InvalidTokenError:
             return jsonify({"success": False, "error": "Invalid token"}), 401
         
-        # Get password from database or request
-        user_resp = supabase.table("users").select("*").eq("id", user_id).execute()
-        if not user_resp.data:
-            return jsonify({"success": False, "error": "User not found"}), 404
+        # Get stored cookies from Supabase
+        stored_data = supabase.table("user_cookies").select("*").eq("email", email).execute()
+        cookies = stored_data.data[0].get("cookies", {}) if stored_data.data else {}
+        
+        if not cookies:
+            return jsonify({"success": False, "error": "No cookies found. Please login again."}), 400
+        
+        # Get all available scraper URLs
+        scraper_urls = get_scraper_urls()
+        if not scraper_urls:
+            return jsonify({"success": False, "error": "No scraper servers configured"}), 500
+        
+        # Try scrapers in random order until one works
+        successful = False
+        errors = []
+        
+        # Load balancing - try in order: best scraper first, then random order
+        best_scraper = get_best_scraper()
+        if best_scraper:
+            # Put the best scraper first
+            scraper_urls = [best_scraper] + [url for url in scraper_urls if url != best_scraper]
+        
+        for scraper_url in scraper_urls:
+            try:
+                print(f"Calling scraper at {scraper_url}/api/scrape for {email}")
+                
+                # Call the scraper service
+                response = requests.post(
+                    f"{scraper_url}/api/scrape",
+                    json={
+                        "email": email,
+                        "cookies": cookies
+                    },
+                    timeout=10  # 10 second timeout
+                )
+                
+                if response.ok:
+                    successful = True
+                    print(f"✅ Successfully called scraper at {scraper_url}")
+                    # Update scraper status
+                    active_scrapers[email] = {
+                        "status": "running", 
+                        "started_at": datetime.utcnow().isoformat(),
+                        "scraper_url": scraper_url
+                    }
+                    break
+                else:
+                    errors.append(f"Scraper {scraper_url} returned: {response.status_code} - {response.text}")
+            except Exception as e:
+                errors.append(f"Failed to connect to {scraper_url}: {str(e)}")
+                print(f"Error connecting to {scraper_url}: {e}")
+        
+        if successful:
+            return jsonify({
+                "success": True,
+                "message": "Refresh process started via external scraper",
+                "status": "running"
+            }), 202
+        else:
+            error_msg = "; ".join(errors)
+            print(f"All scrapers failed: {error_msg}")
+            active_scrapers[email] = {"status": "failed", "error": error_msg}
+            return jsonify({"success": False, "error": f"All scrapers failed: {error_msg}"}), 500
             
-        # Get stored password or fetch from request
-        data = request.get_json() or {}
-        password = data.get("password")
-        
-        # Start the unified scraper in background
-        active_scrapers[email] = {"status": "running", "started_at": datetime.utcnow().isoformat()}
-        
-        # Update the timestamp in the attendance and marks tables
-        current_time = datetime.utcnow().isoformat()
-        
-        # Run the unified scraper in a background thread
-        threading.Thread(
-            target=unified_async_scraper,
-            args=(email, password if password else user_resp.data[0].get("password")),
-            daemon=True
-        ).start()
-        
-        return jsonify({
-            "success": True,
-            "message": "Refresh process started",
-            "status": "running"
-        }), 202
-        
     except Exception as e:
         print(f"Error starting refresh: {e}")
         import traceback
@@ -564,6 +638,47 @@ def check_refresh_status():
         
     except Exception as e:
         print(f"Error checking refresh status: {e}")
+        return jsonify({"success": False, "error": str(e)}), 500
+
+@app.route("/api/scraper-health", methods=["GET"])
+def scraper_health():
+    try:
+        auth_header = request.headers.get("Authorization")
+        if not auth_header or not auth_header.startswith("Bearer "):
+            return jsonify({"success": False, "error": "No token provided"}), 401
+
+        token = auth_header.split(" ")[1]
+        try:
+            jwt.decode(token, os.getenv('JWT_SECRET', 'default-secret-key'), algorithms=["HS256"])
+        except:
+            return jsonify({"success": False, "error": "Invalid token"}), 401
+            
+        scraper_urls = get_scraper_urls()
+        results = {}
+        
+        for url in scraper_urls:
+            try:
+                response = requests.get(f"{url}/health", timeout=5)
+                results[url] = {
+                    "status": "healthy" if response.ok else "unhealthy",
+                    "status_code": response.status_code,
+                    "response_time_ms": response.elapsed.total_seconds() * 1000
+                }
+            except Exception as e:
+                results[url] = {
+                    "status": "error",
+                    "error": str(e)
+                }
+        
+        all_healthy = any(r.get("status") == "healthy" for r in results.values())
+        
+        return jsonify({
+            "success": True,
+            "all_healthy": all_healthy,
+            "scrapers": results
+        })
+        
+    except Exception as e:
         return jsonify({"success": False, "error": str(e)}), 500
 
 if __name__ == "__main__":
