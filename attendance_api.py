@@ -62,21 +62,76 @@ def get_best_scraper():
     return None
 
 def async_scraper(email, password):
-    """Run scraper in background."""
+    """Run scraper in background using external scraper service."""
     try:
-        print(f"Starting attendance scraper for {email}")
-        # Import here to avoid circular imports
-        # This is the correct import statement for srm_scrapper
-        import srm_scrapper
+        print(f"Starting attendance scraper for {email} (via external service)")
         
-        # Use the "attendance" type to only run attendance & marks scraper
-        success = srm_scrapper.run_scraper(email, password, scraper_type="attendance")
-        print(f"Attendance scraper finished for {email} with success: {success}")
+        # Get stored cookies from Supabase
+        stored_data = supabase.table("user_cookies").select("*").eq("email", email).execute()
+        cookies = stored_data.data[0].get("cookies", {}) if stored_data.data else {}
         
-        active_scrapers[email] = {
-            "status": "completed" if success else "failed",
-            "updated_at": datetime.utcnow().isoformat()
-        }
+        if not cookies:
+            # If no cookies, login and get cookies
+            import requests
+            
+            # Get best scraper URL
+            scraper_url = get_best_scraper()
+            if not scraper_url:
+                raise Exception("No scraper servers available")
+                
+            # Login to get cookies
+            login_response = requests.post(
+                f"{scraper_url}/api/login",
+                json={
+                    "email": email,
+                    "password": password
+                },
+                timeout=30
+            )
+            
+            if not login_response.ok or not login_response.json().get("success"):
+                raise Exception("Failed to login via external scraper")
+                
+            cookies = login_response.json().get("cookies", {})
+            
+            # Store cookies in Supabase for future use
+            if cookies:
+                # Delete old record first
+                supabase.table('user_cookies').delete().eq('email', email).execute()
+                
+                # Insert new record
+                cookie_data = {
+                    'email': email,
+                    'cookies': cookies,
+                    'updated_at': datetime.utcnow().isoformat()
+                }
+                supabase.table('user_cookies').insert(cookie_data).execute()
+        
+        # Call the scraper service with cookies
+        scraper_url = get_best_scraper()
+        if not scraper_url:
+            raise Exception("No scraper servers available")
+            
+        print(f"Calling external scraper at {scraper_url}")
+        response = requests.post(
+            f"{scraper_url}/api/scrape",
+            json={
+                "email": email,
+                "cookies": cookies
+            },
+            timeout=10
+        )
+        
+        if response.ok:
+            print(f"Successfully called external scraper for {email}")
+            active_scrapers[email] = {
+                "status": "running", 
+                "started_at": datetime.utcnow().isoformat(),
+                "scraper_url": scraper_url
+            }
+        else:
+            raise Exception(f"Scraper service returned: {response.status_code}")
+            
     except Exception as e:
         print(f"Attendance scraper error for {email}: {e}")
         import traceback
@@ -89,16 +144,71 @@ def delayed_timetable_scraper(email, password, delay_seconds=1):
     active_scrapers[f"timetable_{email}"] = {"status": "waiting"}
     
     try:
-        # Import here to avoid circular imports
-        import srm_scrapper
-        print(f"Starting timetable scraper for {email} after {delay_seconds}s delay")
+        print(f"Starting timetable scraper for {email} after {delay_seconds}s delay (via external service)")
         active_scrapers[f"timetable_{email}"] = {"status": "running"}
-        # Use the "timetable" type to only run timetable scraper
-        success = srm_scrapper.run_scraper(email, password, scraper_type="timetable")
-        print(f"Timetable scraper finished for {email} with success: {success}")
-        active_scrapers[f"timetable_{email}"] = {
-            "status": "completed" if success else "failed"
-        }
+        
+        # Get stored cookies from Supabase
+        stored_data = supabase.table("user_cookies").select("*").eq("email", email).execute()
+        cookies = stored_data.data[0].get("cookies", {}) if stored_data.data else {}
+        
+        if not cookies:
+            # If no cookies, login and get cookies
+            scraper_url = get_best_scraper()
+            if not scraper_url:
+                raise Exception("No scraper servers available")
+                
+            # Login to get cookies
+            login_response = requests.post(
+                f"{scraper_url}/api/login",
+                json={
+                    "email": email,
+                    "password": password
+                },
+                timeout=30
+            )
+            
+            if not login_response.ok or not login_response.json().get("success"):
+                raise Exception("Failed to login via external scraper")
+                
+            cookies = login_response.json().get("cookies", {})
+            
+            # Store cookies in Supabase for future use
+            if cookies:
+                # Delete old record first
+                supabase.table('user_cookies').delete().eq('email', email).execute()
+                
+                # Insert new record
+                cookie_data = {
+                    'email': email,
+                    'cookies': cookies,
+                    'updated_at': datetime.utcnow().isoformat()
+                }
+                supabase.table('user_cookies').insert(cookie_data).execute()
+        
+        # Call the scraper service with cookies
+        scraper_url = get_best_scraper()
+        if not scraper_url:
+            raise Exception("No scraper servers available")
+            
+        print(f"Calling external timetable scraper at {scraper_url}")
+        response = requests.post(
+            f"{scraper_url}/api/scrape-timetable",  # Note: You'll need to add this endpoint to your scraper
+            json={
+                "email": email,
+                "cookies": cookies
+            },
+            timeout=30  # Longer timeout for timetable scraping
+        )
+        
+        if response.ok:
+            print(f"Successfully called external timetable scraper for {email}")
+            active_scrapers[f"timetable_{email}"] = {
+                "status": "completed",
+                "updated_at": datetime.utcnow().isoformat()
+            }
+        else:
+            raise Exception(f"Timetable scraper service returned: {response.status_code}")
+            
     except Exception as e:
         print(f"Timetable scraper error for {email}: {e}")
         import traceback
@@ -194,7 +304,7 @@ def login_route():
         token = jwt.encode({
             "email": email,
             "id": user["id"],
-            "exp": datetime.utcnow() + timedelta(hours=24)
+            "exp": datetime.utcnow() + timedelta(days=30)
         }, os.getenv("JWT_SECRET", "default-secret-key"))
 
         # 5) First, check if user already has timetable data
@@ -483,7 +593,7 @@ def register():
         token = jwt.encode({
             "email": email,
             "id": user["id"],
-            "exp": datetime.utcnow() + timedelta(hours=24)
+            "exp": datetime.utcnow() + timedelta(days=30)
         }, os.getenv("JWT_SECRET", "default-secret-key"))
 
         return jsonify({
