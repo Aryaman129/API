@@ -642,6 +642,7 @@ def refresh_data():
         # Try scrapers in random order until one works
         successful = False
         errors = []
+        used_scraper_url = None
         
         # Load balancing - try in order: best scraper first, then random order
         best_scraper = get_best_scraper()
@@ -665,13 +666,25 @@ def refresh_data():
                 
                 if response.ok:
                     successful = True
+                    used_scraper_url = scraper_url
                     print(f"✅ Successfully called scraper at {scraper_url}")
                     # Update scraper status
+                    started_at = datetime.utcnow().isoformat()
                     active_scrapers[email] = {
                         "status": "running", 
-                        "started_at": datetime.utcnow().isoformat(),
+                        "started_at": started_at,
                         "scraper_url": scraper_url
                     }
+                    
+                    # Start background thread to check completion
+                    print(f"Starting background completion checker for {email}")
+                    completion_thread = threading.Thread(
+                        target=check_scraper_completion,
+                        args=(email, user_id, scraper_url)
+                    )
+                    completion_thread.daemon = True
+                    completion_thread.start()
+                    
                     break
                 else:
                     errors.append(f"Scraper {scraper_url} returned: {response.status_code} - {response.text}")
@@ -683,7 +696,8 @@ def refresh_data():
             return jsonify({
                 "success": True,
                 "message": "Refresh process started via external scraper",
-                "status": "running"
+                "status": "running",
+                "scraper_url": used_scraper_url
             }), 202
         else:
             error_msg = "; ".join(errors)
@@ -721,24 +735,62 @@ def check_refresh_status():
         except jwt.InvalidTokenError:
             return jsonify({"success": False, "error": "Invalid token"}), 401
         
-        # Get attendance scraper status
+        # Get attendance scraper status from active_scrapers dictionary
         status = active_scrapers.get(email, {"status": "not_started"})
         
-        # If completed, get the updated timestamps from the database
-        if status.get("status") == "completed":
-            # Get attendance updated timestamp
+        # Check Supabase directly for recent updates, regardless of active_scrapers status
+        try:
+            # Get current time and time 5 minutes ago (to account for potential time differences)
+            now = datetime.utcnow()
+            five_mins_ago = (now - timedelta(minutes=5)).isoformat()
+            
+            # Check for attendance updates in the last 5 minutes
             att_resp = supabase.table("attendance").select("created_at,updated_at").eq("user_id", user_id).execute()
             marks_resp = supabase.table("marks").select("created_at,updated_at").eq("user_id", user_id).execute()
             
             updated_at = None
+            data_updated = False
+            
+            # Check if attendance has recent updates
             if att_resp.data and len(att_resp.data) > 0:
-                updated_at = att_resp.data[0].get("updated_at")
-            elif marks_resp.data and len(marks_resp.data) > 0:
-                updated_at = marks_resp.data[0].get("updated_at")
+                if att_resp.data[0].get("updated_at"):
+                    updated_at = att_resp.data[0].get("updated_at")
+                    # If updated within the last 5 minutes, consider it a success
+                    if updated_at > five_mins_ago:
+                        data_updated = True
+            
+            # If attendance isn't recently updated, check marks
+            if not data_updated and marks_resp.data and len(marks_resp.data) > 0:
+                if marks_resp.data[0].get("updated_at"):
+                    marks_updated_at = marks_resp.data[0].get("updated_at")
+                    if marks_updated_at > five_mins_ago:
+                        data_updated = True
+                        updated_at = marks_updated_at
+            
+            # If we found recent updates, override the status
+            if data_updated:
+                print(f"✅ Found recent data updates for {email}, marking refresh as completed")
+                status = {"status": "completed", "updated_at": updated_at}
+                # Update the active_scrapers dictionary too
+                active_scrapers[email] = status
+            elif status.get("status") == "running":
+                # Check if the job has been running too long (more than 3 minutes)
+                if "started_at" in status:
+                    start_time = datetime.fromisoformat(status["started_at"])
+                    elapsed = (now - start_time).total_seconds()
+                    if elapsed > 180:  # 3 minutes
+                        # Check if we have any data at all
+                        if updated_at:
+                            print(f"⚠️ Scraper for {email} ran for over 3 minutes, but we have some data. Marking as completed.")
+                            status = {"status": "completed", "updated_at": updated_at}
+                            active_scrapers[email] = status
+                        else:
+                            print(f"⚠️ Scraper for {email} timed out after 3 minutes with no data")
+                            status = {"status": "timeout", "error": "Scraper took too long to respond"}
+                            active_scrapers[email] = status
+        except Exception as check_err:
+            print(f"Error checking Supabase for updates: {check_err}")
                 
-            if updated_at:
-                status["updated_at"] = updated_at
-        
         return jsonify({
             "success": True,
             "status": status.get("status", "not_started"),
@@ -789,6 +841,59 @@ def scraper_health():
         
     except Exception as e:
         return jsonify({"success": False, "error": str(e)}), 500
+
+# Add this function immediately before the /api/refresh-data route
+def check_scraper_completion(email, user_id, scraper_url):
+    """Background task to check if scraper completed and update active_scrapers accordingly"""
+    try:
+        # Wait a bit for scraper to start working
+        time.sleep(15)
+        
+        print(f"Checking completion status for {email} scraper job...")
+        max_attempts = 20
+        
+        for attempt in range(max_attempts):
+            try:
+                # Check Supabase for updated data
+                att_resp = supabase.table("attendance").select("updated_at").eq("user_id", user_id).execute()
+                marks_resp = supabase.table("marks").select("updated_at").eq("user_id", user_id).execute()
+                
+                # Get the current status
+                status = active_scrapers.get(email, {})
+                started_at = status.get("started_at")
+                
+                # Check if we have attendance data updated after scraper started
+                if att_resp.data and len(att_resp.data) > 0 and att_resp.data[0].get("updated_at"):
+                    updated_at = att_resp.data[0].get("updated_at")
+                    if not started_at or updated_at > started_at:
+                        print(f"✅ Detected completion for {email}: attendance data updated")
+                        active_scrapers[email] = {"status": "completed", "updated_at": updated_at}
+                        return
+                
+                # Check marks data too
+                if marks_resp.data and len(marks_resp.data) > 0 and marks_resp.data[0].get("updated_at"):
+                    updated_at = marks_resp.data[0].get("updated_at")
+                    if not started_at or updated_at > started_at:
+                        print(f"✅ Detected completion for {email}: marks data updated")
+                        active_scrapers[email] = {"status": "completed", "updated_at": updated_at}
+                        return
+                
+                # If still running and we've checked too many times, mark as error
+                if attempt == max_attempts - 1:
+                    print(f"⚠️ Scraper for {email} timed out after {max_attempts} checks")
+                    active_scrapers[email] = {"status": "error", "error": "Scraper took too long to update data"}
+                    return
+                    
+                # Wait before checking again
+                time.sleep(15)
+                
+            except Exception as e:
+                print(f"Error checking completion for {email}: {str(e)}")
+                # Don't update status on error, keep trying
+        
+    except Exception as e:
+        print(f"Background task error for {email}: {str(e)}")
+        active_scrapers[email] = {"status": "error", "error": str(e)}
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
