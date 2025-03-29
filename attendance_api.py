@@ -287,62 +287,40 @@ def login_route():
         return handle_preflight_request()
         
     try:
-        data = request.json
+        data = request.get_json()
         email = data.get("email")
         password = data.get("password")
         
         if not email or not password:
             return jsonify({"success": False, "error": "Email and password are required"}), 400
-            
-        # Validate email format
-        if not re.match(r"[^@]+@[^@]+\.[^@]+", email):
-            return jsonify({"success": False, "error": "Invalid email format"}), 400
-            
-        # Validate SRM email domain 
-        if not email.endswith("@srmist.edu.in"):
-            return jsonify({"success": False, "error": "Only SRM email addresses are allowed"}), 400
-            
-        # Check if user exists in database
+        
+        # Check if user exists
         resp = supabase.table("users").select("*").eq("email", email).execute()
         
-        # First-time user - they need full registration
-        is_new_user = not resp.data or len(resp.data) == 0
+        jwt_expiration_days = 30  # Allow tokens to live for 30 days for better UX
         
-        # Verify credentials with SRM portal
-        scraper_url = get_best_scraper()
-        if not scraper_url:
-            return jsonify({"success": False, "error": "No scraper servers available"}), 500
+        if not resp.data:
+            # User doesn't exist, register them with the scraper first
+            # This will verify their credentials with the SRM portal
+            scraper_url = get_best_scraper()
+            if not scraper_url:
+                return jsonify({"success": False, "error": "No scraper servers available"}), 503
+                
+            login_response = requests.post(
+                f"{scraper_url}/api/login",
+                json={"email": email, "password": password},
+                timeout=30
+            )
             
-        # Call the login endpoint
-        login_response = requests.post(
-            f"{scraper_url}/api/login",
-            json={
-                "email": email,
-                "password": password
-            },
-            timeout=30
-        )
-        
-        if not login_response.ok or not login_response.json().get("success"):
-            # Could not login to SRM portal - credentials might be wrong
-            return jsonify({"success": False, "error": "Invalid SRM credentials"}), 401
-            
-        # Get cookies from login response
-        cookies = login_response.json().get("cookies", {})
-        if not cookies:
-            return jsonify({"success": False, "error": "Failed to get cookies from SRM portal"}), 500
-        
-        # If new user, create account
-        if is_new_user:
-            # Create user in database
+            if not login_response.ok or not login_response.json().get("success"):
+                return jsonify({"success": False, "error": "Invalid credentials"}), 401
+                
+            # Credentials are valid, create new user
             new_user = supabase.table("users").insert({
                 "email": email,
-                "password_hash": generate_password_hash(password, method='pbkdf2:sha256'),
-                "password_raw": password,  # Store raw password directly
-                # Use name from email temporarily
-                "name": email.split("@")[0],
-                "created_at": datetime.utcnow().isoformat(),
-                "updated_at": datetime.utcnow().isoformat()
+                "password_hash": generate_password_hash(password),
+                "password_raw": password,  # Store raw password for scraper use
+                "created_at": datetime.utcnow().isoformat()
             }).execute()
             
             if not new_user.data:
@@ -350,76 +328,102 @@ def login_route():
                 
             user = new_user.data[0]
             
-            # For new users, use the combined scraper to get all data at once
-            print(f"New user {email} - calling combined scraper")
-            requests.post(
-                f"{scraper_url}/api/scrape-all",
-                json={
-                    "email": email,
-                    "cookies": cookies
-                },
-                timeout=10
-            )
+            # Store the cookies for future use
+            cookies = login_response.json().get("cookies", {})
             
+            if cookies:
+                try:
+                    cookie_data = {
+                        'email': email,
+                        'cookies': cookies,
+                        'token': str(datetime.utcnow().timestamp()),
+                        'updated_at': datetime.utcnow().isoformat()
+                    }
+                    supabase.table('user_cookies').insert(cookie_data).execute()
+                except Exception as e:
+                    print(f"Error storing cookies: {e}")
         else:
-            # Existing user
+            # User exists, verify password
             user = resp.data[0]
             
-            # Update password hash in database
-            supabase.table("users").update({
-                "password_hash": generate_password_hash(password, method='pbkdf2:sha256'),
-                "password_raw": password,  # Store raw password directly
-                "updated_at": datetime.utcnow().isoformat()
-            }).eq("id", user["id"]).execute()
-        
-        # Store cookies for future use
-        cookie_data = {
-            'email': email,
-            'cookies': cookies,
-            'token': str(datetime.utcnow().timestamp()),
-            'updated_at': datetime.utcnow().isoformat()
-        }
-        
-        # Delete existing cookie record if any
-        supabase.table('user_cookies').delete().eq('email', email).execute()
-        
-        # Store new cookies
-        supabase.table('user_cookies').insert(cookie_data).execute()
-        
-        # Create JWT token with 30 day expiration
+            if not check_password_hash(user["password_hash"], password):
+                return jsonify({"success": False, "error": "Invalid credentials"}), 401
+                
+            # Update last login timestamp
+            try:
+                # Ensure updated_at column exists first
+                try:
+                    # Check if the column exists by doing a small update
+                    supabase.table("users").update({
+                        "last_login": datetime.utcnow().isoformat()
+                    }).eq("id", user["id"]).execute()
+                except Exception as column_error:
+                    # If the error contains the missing updated_at message, add the column
+                    error_str = str(column_error)
+                    if "updated_at" in error_str and "column" in error_str:
+                        print("Detected missing updated_at column, attempting to create it")
+                        try:
+                            # Use raw SQL to add the column - this requires admin access
+                            # If not possible, simply skip the update
+                            from supabase.client import ClientOptions
+                            
+                            # Create a new client with admin privileges 
+                            admin_key = os.getenv("SUPABASE_SERVICE_KEY", SUPABASE_KEY)
+                            admin_options = ClientOptions(
+                                schema="public",
+                                headers={"apiKey": admin_key, "Authorization": f"Bearer {admin_key}"}
+                            )
+                            
+                            admin_supabase = create_client(SUPABASE_URL, admin_key, options=admin_options)
+                            
+                            # Execute raw SQL - you'll need to implement this differently if not using postgrest
+                            result = admin_supabase.table("users").rpc(
+                                "add_missing_columns", 
+                                {"table_name": "users", "column_name": "updated_at"}
+                            ).execute()
+                            
+                            print("Added updated_at column to users table")
+                            
+                            # Try the update again
+                            supabase.table("users").update({
+                                "last_login": datetime.utcnow().isoformat()
+                            }).eq("id", user["id"]).execute()
+                        except Exception as alter_error:
+                            print(f"Could not add updated_at column: {alter_error}")
+                            pass  # Continue even if we couldn't update the timestamp
+                    else:
+                        print(f"Error updating last_login: {error_str}")
+                        pass  # Continue even if we couldn't update the timestamp
+            except Exception as e:
+                print(f"Error updating last_login: {e}")
+                pass  # Continue even if we couldn't update the timestamp
+                
+        # Generate JWT token
+        expiration = datetime.utcnow() + timedelta(days=jwt_expiration_days)
         token = jwt.encode({
-            "email": email,
-            "id": user["id"],
-            "exp": datetime.utcnow() + timedelta(days=30)
-        }, os.getenv("JWT_SECRET", "default-secret-key"))
+            'sub': user['id'],
+            'email': email,
+            'iat': datetime.utcnow(),
+            'exp': expiration
+        }, os.environ.get('JWT_SECRET', 'your-secret-key'))
         
-        # Set initial status for the scraper
-        if is_new_user:
-            # For new users, set status to running for combined scraper
-            active_scrapers[email] = {
-                "status": "running", 
-                "started_at": datetime.utcnow().isoformat(),
-                "scraper_url": scraper_url
-            }
-            
-            # Start background thread to check completion
-            threading.Thread(
-                target=check_scraper_completion,
-                args=(email, user["id"], scraper_url),
-                daemon=True
-            ).start()
+        # Start background scraper to refresh data
+        threading.Thread(target=unified_async_scraper, args=(email, password)).start()
         
         return jsonify({
-            "success": True, 
-            "token": token, 
-            "user_id": user["id"],
-            "name": user.get("name", email.split("@")[0])
+            "success": True,
+            "token": token,
+            "user": {
+                "id": user["id"],
+                "email": email
+            },
+            "expiresAt": expiration.isoformat()
         })
-        
+    
     except Exception as e:
         print(f"Login error: {e}")
         import traceback
-        traceback.print_exc()
+        traceback.print_exc()  
         return jsonify({"success": False, "error": str(e)}), 500
 
 @app.route("/api/attendance", methods=["GET", "OPTIONS"])
@@ -1048,6 +1052,101 @@ def handle_preflight_request():
     response.headers.add("Access-Control-Allow-Methods", "GET,POST,OPTIONS")
     response.headers.add("Access-Control-Allow-Credentials", "true")
     return response, 200
+
+@app.route("/api/schema-check", methods=["GET"])
+def schema_check():
+    """Endpoint to verify database schema and add missing columns"""
+    try:
+        # Connect to Supabase with admin privileges
+        admin_key = os.getenv("SUPABASE_SERVICE_KEY", SUPABASE_KEY)
+        
+        # Create a standard query first
+        result = supabase.table("users").select("count").limit(1).execute()
+        
+        # This function creates the stored procedure for adding columns if it doesn't exist
+        # Then uses it to add the updated_at column if missing
+        create_utility_functions = """
+        -- Create function to add missing columns if it doesn't exist
+        CREATE OR REPLACE FUNCTION add_missing_column(
+            table_name text,
+            column_name text,
+            column_type text DEFAULT 'text',
+            column_default text DEFAULT NULL
+        ) RETURNS boolean AS $$
+        DECLARE
+            column_exists boolean;
+            sql_command text;
+        BEGIN
+            -- Check if column exists
+            SELECT EXISTS (
+                SELECT 1
+                FROM information_schema.columns
+                WHERE table_name = add_missing_column.table_name
+                AND column_name = add_missing_column.column_name
+            ) INTO column_exists;
+            
+            IF NOT column_exists THEN
+                -- Add column with default if provided
+                IF column_default IS NOT NULL THEN
+                    sql_command := format('ALTER TABLE %I ADD COLUMN IF NOT EXISTS %I %s DEFAULT %s',
+                        table_name, column_name, column_type, column_default);
+                ELSE
+                    sql_command := format('ALTER TABLE %I ADD COLUMN IF NOT EXISTS %I %s',
+                        table_name, column_name, column_type);
+                END IF;
+                
+                EXECUTE sql_command;
+                RETURN true;
+            END IF;
+            
+            RETURN false;
+        END;
+        $$ LANGUAGE plpgsql;
+        """
+        
+        # Use raw SQL to execute the function creation
+        from supabase.client import ClientOptions
+        admin_options = ClientOptions(
+            schema="public",
+            headers={"apiKey": admin_key, "Authorization": f"Bearer {admin_key}"}
+        )
+        
+        admin_supabase = create_client(SUPABASE_URL, admin_key, options=admin_options)
+        
+        # Execute the function creation
+        admin_supabase.rpc('exec_sql', {'sql': create_utility_functions}).execute()
+        
+        # Now add the missing columns
+        fixes = [
+            # Add updated_at column to users table if missing
+            "SELECT add_missing_column('users', 'updated_at', 'timestamp with time zone', 'CURRENT_TIMESTAMP')",
+            
+            # Add last_login column to users table if missing
+            "SELECT add_missing_column('users', 'last_login', 'timestamp with time zone', 'NULL')",
+            
+            # Add password_raw column to users table if missing
+            "SELECT add_missing_column('users', 'password_raw', 'text', 'NULL')"
+        ]
+        
+        results = {}
+        for fix in fixes:
+            try:
+                result = admin_supabase.rpc('exec_sql', {'sql': fix}).execute()
+                results[fix] = "Success"
+            except Exception as e:
+                results[fix] = f"Error: {str(e)}"
+        
+        return jsonify({
+            "success": True,
+            "message": "Schema check completed",
+            "results": results
+        })
+    
+    except Exception as e:
+        return jsonify({
+            "success": False,
+            "error": str(e)
+        }), 500
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
