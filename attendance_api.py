@@ -11,6 +11,7 @@ from supabase import create_client, Client
 import requests
 import random
 import json
+import re
 
 # Load environment variables
 load_dotenv()
@@ -567,67 +568,173 @@ def get_scraper_status():
 @app.route("/api/register", methods=["POST", "OPTIONS"])
 def register():
     if request.method == "OPTIONS":
-        return jsonify({"success": True}), 200
+        return handle_preflight_request()
+        
     try:
-        data = request.get_json()
+        data = request.json
+        name = data.get("name")
         email = data.get("email")
         password = data.get("password")
-        print(f"Registration attempt for email: {email}")
-        if not email or not password:
-            return jsonify({"success": False, "error": "Email and password required"}), 400
-
+        
+        # Validate required fields
+        if not email or not password or not name:
+            return jsonify({"success": False, "error": "Name, email and password are required"}), 400
+        
+        # Validate email format
+        if not re.match(r"[^@]+@[^@]+\.[^@]+", email):
+            return jsonify({"success": False, "error": "Invalid email format"}), 400
+            
+        # Validate SRM email domain
+        if not email.endswith("@srmist.edu.in"):
+            return jsonify({"success": False, "error": "Only SRM email addresses are allowed"}), 400
+        
         # Check if user already exists
-        resp = supabase.table("users").select("*").eq("email", email).execute()
-        if resp.data and len(resp.data) > 0:
-            return jsonify({"success": False, "error": "User already exists"}), 400
-
-        new_user = {
-            "email": email,
-            "password_hash": generate_password_hash(password, method='pbkdf2:sha256'),
-            "registration_number": ""
+        existing_user = supabase.table("users").select("*").eq("email", email).execute()
+        if existing_user.data:
+            # User exists, but let's check if they have data already
+            user_id = existing_user.data[0]["id"]
+            
+            # Check if they have attendance data
+            attendance_data = supabase.table("attendance").select("count").eq("user_id", user_id).execute()
+            if attendance_data.data and attendance_data.data[0]["count"] > 0:
+                return jsonify({"success": False, "error": "User already exists"}), 400
+                
+            # If they don't have data, we can proceed with login and scraping
+        
+        # For new users, try to login to SRM portal first to ensure credentials are correct
+        scraper_url = get_best_scraper()
+        if not scraper_url:
+            return jsonify({"success": False, "error": "No scraper servers available"}), 500
+            
+        # Call the login endpoint
+        login_response = requests.post(
+            f"{scraper_url}/api/login",
+            json={
+                "email": email,
+                "password": password
+            },
+            timeout=30
+        )
+        
+        if not login_response.ok:
+            # Could not login to SRM portal - credentials might be wrong
+            return jsonify({"success": False, "error": "Invalid SRM credentials"}), 401
+            
+        # Get cookies from login response
+        cookies = login_response.json().get("cookies", {})
+        if not cookies:
+            return jsonify({"success": False, "error": "Failed to get cookies from SRM portal"}), 500
+            
+        # Create user or update existing user in Supabase
+        if existing_user.data:
+            user = existing_user.data[0]
+            user_id = user["id"]
+            
+            # Update user information
+            supabase.table("users").update({
+                "name": name, 
+                "password": password,  # Store for future use
+                "updated_at": datetime.utcnow().isoformat()
+            }).eq("id", user_id).execute()
+        else:
+            # Create new user
+            new_user = supabase.table("users").insert({
+                "name": name,
+                "email": email,
+                "password": password,  # Store for future use
+                "created_at": datetime.utcnow().isoformat(),
+                "updated_at": datetime.utcnow().isoformat()
+            }).execute()
+            
+            if not new_user.data:
+                return jsonify({"success": False, "error": "Failed to create user"}), 500
+                
+            user_id = new_user.data[0]["id"]
+        
+        # Store cookies for future use
+        cookie_data = {
+            'email': email,
+            'cookies': cookies,
+            'token': str(datetime.utcnow().timestamp()),
+            'updated_at': datetime.utcnow().isoformat()
         }
-        insert_resp = supabase.table("users").insert(new_user).execute()
-        if not insert_resp.data:
-            return jsonify({"success": False, "error": "Failed to create user"}), 500
-
-        user = insert_resp.data[0]
+        
+        # Delete existing cookie record if any
+        supabase.table('user_cookies').delete().eq('email', email).execute()
+        
+        # Store new cookies
+        supabase.table('user_cookies').insert(cookie_data).execute()
+        
+        # Create JWT token with 30 day expiration
         token = jwt.encode({
             "email": email,
-            "id": user["id"],
+            "id": user_id,
             "exp": datetime.utcnow() + timedelta(days=30)
         }, os.getenv("JWT_SECRET", "default-secret-key"))
-
-        return jsonify({
-            "success": True,
-            "token": token,
-            "user": {"email": email, "id": user["id"]}
-        })
+        
+        # Call the combined scraper to get all data at once (more efficient)
+        # This will scrape attendance, marks, and timetable data with a single Chrome instance
+        requests.post(
+            f"{scraper_url}/api/scrape-all",
+            json={
+                "email": email,
+                "cookies": cookies
+            },
+            timeout=10
+        )
+        
+        # Set initial status for the scraper
+        active_scrapers[email] = {
+            "status": "running", 
+            "started_at": datetime.utcnow().isoformat(),
+            "scraper_url": scraper_url
+        }
+        
+        # Start background thread to check completion
+        threading.Thread(
+            target=check_scraper_completion,
+            args=(email, user_id, scraper_url),
+            daemon=True
+        ).start()
+        
+        return jsonify({"success": True, "token": token, "user_id": user_id, "name": name})
+        
     except Exception as e:
-        print(f"Registration error: {e}")
+        import traceback
+        traceback.print_exc()
         return jsonify({"success": False, "error": str(e)}), 500
 
 @app.route("/api/refresh-data", methods=["POST", "OPTIONS"])
 def refresh_data():
     if request.method == "OPTIONS":
-        return jsonify({"success": True}), 200
-    
-    try:
-        # Get authorization header
-        auth_header = request.headers.get("Authorization")
-        if not auth_header or not auth_header.startswith("Bearer "):
-            return jsonify({"success": False, "error": "No token provided"}), 401
-
-        token = auth_header.split(" ")[1]
+        return handle_preflight_request()
         
-        try:
-            # Decode JWT token to get user information
-            payload = jwt.decode(token, os.getenv('JWT_SECRET', 'default-secret-key'), algorithms=["HS256"])
-            user_id = payload["id"]
-            email = payload["email"]
-        except jwt.ExpiredSignatureError:
-            return jsonify({"success": False, "error": "Token expired"}), 401
-        except jwt.InvalidTokenError:
-            return jsonify({"success": False, "error": "Invalid token"}), 401
+    token = get_token_from_header(request)
+    if not token:
+        return jsonify({"success": False, "error": "No token provided"}), 401
+        
+    try:
+        # Verify token
+        decoded = jwt.decode(token, os.getenv("JWT_SECRET", "default-secret-key"), algorithms=["HS256"])
+        email = decoded["email"]
+        user_id = decoded["id"]
+        
+        print(f"Starting refresh for user {email}")
+        
+        # Check if scraper is already running for this user
+        if email in active_scrapers and active_scrapers[email].get("status") == "running":
+            print(f"Scraper already running for {email}")
+            return jsonify({
+                "success": True, 
+                "message": "Scraper already running", 
+                "status": "running"
+            })
+            
+        # Mark as running
+        active_scrapers[email] = {
+            "status": "running", 
+            "started_at": datetime.utcnow().isoformat()
+        }
         
         # Get stored cookies from Supabase
         stored_data = supabase.table("user_cookies").select("*").eq("email", email).execute()
@@ -636,81 +743,39 @@ def refresh_data():
         if not cookies:
             return jsonify({"success": False, "error": "No cookies found. Please login again."}), 400
         
-        # Get all available scraper URLs
-        scraper_urls = get_scraper_urls()
-        if not scraper_urls:
-            return jsonify({"success": False, "error": "No scraper servers configured"}), 500
+        # Get scraper URL
+        scraper_url = get_best_scraper()
+        if not scraper_url:
+            return jsonify({"success": False, "error": "No scraper servers available"}), 500
+            
+        # Schedule background task to monitor completion
+        threading.Thread(
+            target=check_scraper_completion,
+            args=(email, user_id, scraper_url),
+            daemon=True
+        ).start()
         
-        # Try scrapers in random order until one works
-        successful = False
-        errors = []
-        used_scraper_url = None
+        # Call the scraper service with cookies for attendance/marks only
+        print(f"Calling external scraper at {scraper_url}")
+        response = requests.post(
+            f"{scraper_url}/api/scrape",
+            json={
+                "email": email,
+                "cookies": cookies
+            },
+            timeout=10
+        )
         
-        # Load balancing - try in order: best scraper first, then random order
-        best_scraper = get_best_scraper()
-        if best_scraper:
-            # Put the best scraper first
-            scraper_urls = [best_scraper] + [url for url in scraper_urls if url != best_scraper]
-        
-        for scraper_url in scraper_urls:
-            try:
-                print(f"Calling scraper at {scraper_url}/api/scrape for {email}")
-                
-                # Call the scraper service
-                response = requests.post(
-                    f"{scraper_url}/api/scrape",
-                    json={
-                        "email": email,
-                        "cookies": cookies
-                    },
-                    timeout=10  # 10 second timeout
-                )
-                
-                if response.ok:
-                    successful = True
-                    used_scraper_url = scraper_url
-                    print(f"✅ Successfully called scraper at {scraper_url}")
-                    # Update scraper status
-                    started_at = datetime.utcnow().isoformat()
-                    active_scrapers[email] = {
-                        "status": "running", 
-                        "started_at": started_at,
-                        "scraper_url": scraper_url
-                    }
-                    
-                    # Start background thread to check completion
-                    print(f"Starting background completion checker for {email}")
-                    completion_thread = threading.Thread(
-                        target=check_scraper_completion,
-                        args=(email, user_id, scraper_url)
-                    )
-                    completion_thread.daemon = True
-                    completion_thread.start()
-                    
-                    break
-                else:
-                    errors.append(f"Scraper {scraper_url} returned: {response.status_code} - {response.text}")
-            except Exception as e:
-                errors.append(f"Failed to connect to {scraper_url}: {str(e)}")
-                print(f"Error connecting to {scraper_url}: {e}")
-        
-        if successful:
-            return jsonify({
-                "success": True,
-                "message": "Refresh process started via external scraper",
-                "status": "running",
-                "scraper_url": used_scraper_url
-            }), 202
+        if response.ok:
+            print(f"Successfully called external scraper for {email}")
+            return jsonify({"success": True, "message": "Refresh started", "status": "running"})
         else:
-            error_msg = "; ".join(errors)
-            print(f"All scrapers failed: {error_msg}")
-            active_scrapers[email] = {"status": "failed", "error": error_msg}
-            return jsonify({"success": False, "error": f"All scrapers failed: {error_msg}"}), 500
+            active_scrapers[email] = {"status": "error", "error": f"Scraper service returned: {response.status_code}"}
+            return jsonify({"success": False, "error": f"Scraper service returned: {response.status_code}"})
             
     except Exception as e:
-        print(f"Error starting refresh: {e}")
-        import traceback
-        traceback.print_exc()
+        print(f"Error starting refresh: {str(e)}")
+        active_scrapers[email] = {"status": "error", "error": str(e)}
         return jsonify({"success": False, "error": str(e)}), 500
 
 
