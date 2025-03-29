@@ -22,8 +22,12 @@ supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 app = Flask(__name__)
 
-# Enable CORS for all routes with proper configuration
-CORS(app, origins=["https://academia-khaki.vercel.app", "http://localhost:3000"], supports_credentials=True, allow_headers=["Content-Type", "Authorization"])
+# Configure CORS properly to allow requests from the frontend
+CORS(app, 
+     origins=["https://academia-khaki.vercel.app", "http://localhost:3000"], 
+     supports_credentials=True,
+     allow_headers=["Content-Type", "Authorization"],
+     methods=["GET", "POST", "OPTIONS"])
 
 active_scrapers = {}
 
@@ -1006,6 +1010,15 @@ def check_scraper_completion(email, user_id, scraper_url):
     except Exception as e:
         print(f"Background task error for {email}: {str(e)}")
         active_scrapers[email] = {"status": "error", "error": str(e)}
+
+# Helper function to handle preflight OPTIONS requests
+def handle_preflight_request():
+    response = jsonify({"success": True})
+    response.headers.add("Access-Control-Allow-Origin", "*")
+    response.headers.add("Access-Control-Allow-Headers", "Content-Type,Authorization")
+    response.headers.add("Access-Control-Allow-Methods", "GET,POST,OPTIONS")
+    response.headers.add("Access-Control-Allow-Credentials", "true")
+    return response, 200
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
