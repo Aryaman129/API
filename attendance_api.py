@@ -98,10 +98,11 @@ def async_scraper(email, password):
                 # Delete old record first
                 supabase.table('user_cookies').delete().eq('email', email).execute()
                 
-                # Insert new record
+                # Insert new record with token
                 cookie_data = {
                     'email': email,
                     'cookies': cookies,
+                    'token': str(datetime.utcnow().timestamp()),  # Add token value
                     'updated_at': datetime.utcnow().isoformat()
                 }
                 supabase.table('user_cookies').insert(cookie_data).execute()
@@ -176,10 +177,11 @@ def delayed_timetable_scraper(email, password, delay_seconds=1):
                 # Delete old record first
                 supabase.table('user_cookies').delete().eq('email', email).execute()
                 
-                # Insert new record
+                # Insert new record with token
                 cookie_data = {
                     'email': email,
                     'cookies': cookies,
+                    'token': str(datetime.utcnow().timestamp()),  # Add token value
                     'updated_at': datetime.utcnow().isoformat()
                 }
                 supabase.table('user_cookies').insert(cookie_data).execute()
