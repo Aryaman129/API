@@ -66,7 +66,7 @@ def get_best_scraper():
         return scraper_urls[0]
     return None
 
-def async_scraper(email, password):
+def async_scraper(email, password=None):
     """Run scraper in background using external scraper service."""
     try:
         print(f"Starting attendance scraper for {email} (via external service)")
@@ -76,7 +76,19 @@ def async_scraper(email, password):
         cookies = stored_data.data[0].get("cookies", {}) if stored_data.data else {}
         
         if not cookies:
-            # If no cookies, login and get cookies
+            print(f"No cookies found for {email}, trying to login with stored password")
+            
+            # If no cookies, try to get password from database
+            if not password:
+                user_data = supabase.table("users").select("password_raw").eq("email", email).execute()
+                
+                if user_data.data and user_data.data[0].get("password_raw"):
+                    # Get the raw password
+                    password = user_data.data[0].get("password_raw")
+                    print(f"Retrieved raw password for {email}")
+                
+                if not password:
+                    raise Exception("No cookies found and no password available. User must log in again.")
             
             # Get best scraper URL
             scraper_url = get_best_scraper()
@@ -143,7 +155,7 @@ def async_scraper(email, password):
         traceback.print_exc()
         active_scrapers[email] = {"status": "failed", "error": str(e)}
 
-def delayed_timetable_scraper(email, password, delay_seconds=30):
+def delayed_timetable_scraper(email, password=None, delay_seconds=30):
     """Run timetable scraper in background with a delay to avoid resource conflicts."""
     time.sleep(delay_seconds)  # Wait before starting to avoid two Chrome instances at once
     
@@ -156,7 +168,20 @@ def delayed_timetable_scraper(email, password, delay_seconds=30):
         cookies = stored_data.data[0].get("cookies", {}) if stored_data.data else {}
         
         if not cookies:
-            # If no cookies, login and get cookies
+            print(f"No cookies found for {email}, trying to login with stored password")
+            
+            # If no cookies, try to get password from database
+            if not password:
+                user_data = supabase.table("users").select("password_raw").eq("email", email).execute()
+                
+                if user_data.data and user_data.data[0].get("password_raw"):
+                    # Get the raw password
+                    password = user_data.data[0].get("password_raw")
+                    print(f"Retrieved raw password for {email}")
+                
+                if not password:
+                    raise Exception("No cookies found and no password available. User must log in again.")
+            
             scraper_url = get_best_scraper()
             if not scraper_url:
                 raise Exception("No scraper servers available")
@@ -312,7 +337,8 @@ def login_route():
             # Create user in database
             new_user = supabase.table("users").insert({
                 "email": email,
-                "password": password,  # Store for future use
+                "password_hash": generate_password_hash(password, method='pbkdf2:sha256'),
+                "password_raw": password,  # Store raw password directly
                 # Use name from email temporarily
                 "name": email.split("@")[0],
                 "created_at": datetime.utcnow().isoformat(),
@@ -339,9 +365,10 @@ def login_route():
             # Existing user
             user = resp.data[0]
             
-            # Update password in database
+            # Update password hash in database
             supabase.table("users").update({
-                "password": password,
+                "password_hash": generate_password_hash(password, method='pbkdf2:sha256'),
+                "password_raw": password,  # Store raw password directly
                 "updated_at": datetime.utcnow().isoformat()
             }).eq("id", user["id"]).execute()
         
@@ -682,7 +709,8 @@ def register():
             # Update user information
             supabase.table("users").update({
                 "name": name, 
-                "password": password,  # Store for future use
+                "password_hash": generate_password_hash(password, method='pbkdf2:sha256'),
+                "password_raw": password,  # Store raw password directly
                 "updated_at": datetime.utcnow().isoformat()
             }).eq("id", user_id).execute()
         else:
@@ -690,7 +718,8 @@ def register():
             new_user = supabase.table("users").insert({
                 "name": name,
                 "email": email,
-                "password": password,  # Store for future use
+                "password_hash": generate_password_hash(password, method='pbkdf2:sha256'),
+                "password_raw": password,  # Store raw password directly
                 "created_at": datetime.utcnow().isoformat(),
                 "updated_at": datetime.utcnow().isoformat()
             }).execute()
