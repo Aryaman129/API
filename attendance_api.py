@@ -139,10 +139,9 @@ def async_scraper(email, password):
         traceback.print_exc()
         active_scrapers[email] = {"status": "failed", "error": str(e)}
 
-def delayed_timetable_scraper(email, password, delay_seconds=1):
+def delayed_timetable_scraper(email, password, delay_seconds=30):
     """Run timetable scraper in background with a delay to avoid resource conflicts."""
     time.sleep(delay_seconds)  # Wait before starting to avoid two Chrome instances at once
-    active_scrapers[f"timetable_{email}"] = {"status": "waiting"}
     
     try:
         print(f"Starting timetable scraper for {email} after {delay_seconds}s delay (via external service)")
@@ -186,6 +185,12 @@ def delayed_timetable_scraper(email, password, delay_seconds=1):
                     'updated_at': datetime.utcnow().isoformat()
                 }
                 supabase.table('user_cookies').insert(cookie_data).execute()
+        
+        # Check if attendance scraper is still running
+        # If it is, wait a bit longer to ensure we don't have resource conflicts
+        if email in active_scrapers and active_scrapers[email].get("status") == "running":
+            print(f"Attendance scraper still running for {email}, waiting an additional 30 seconds")
+            time.sleep(30)  # Wait longer if attendance scraper is still running
         
         # Call the scraper service with cookies
         scraper_url = get_best_scraper()
@@ -250,100 +255,140 @@ def health_check():
 @app.route("/api/login", methods=["POST", "OPTIONS"])
 def login_route():
     if request.method == "OPTIONS":
-        return jsonify({"success": True}), 200
+        return handle_preflight_request()
+        
     try:
-        data = request.get_json()
-        if not data:
-            return jsonify({"success": False, "error": "No data provided"}), 400
-
+        data = request.json
         email = data.get("email")
         password = data.get("password")
+        
         if not email or not password:
-            return jsonify({"success": False, "error": "Email and password required"}), 400
-
-        print(f"Login attempt for email: {email}")
-
-        # 1) Check if user exists by email
-        try:
-            resp = supabase.table("users").select("*").eq("email", email).execute()
-            if not resp.data or len(resp.data) == 0:
-                # 2) Create new user with empty registration_number
-                new_user = {
+            return jsonify({"success": False, "error": "Email and password are required"}), 400
+            
+        # Validate email format
+        if not re.match(r"[^@]+@[^@]+\.[^@]+", email):
+            return jsonify({"success": False, "error": "Invalid email format"}), 400
+            
+        # Validate SRM email domain 
+        if not email.endswith("@srmist.edu.in"):
+            return jsonify({"success": False, "error": "Only SRM email addresses are allowed"}), 400
+            
+        # Check if user exists in database
+        resp = supabase.table("users").select("*").eq("email", email).execute()
+        
+        # First-time user - they need full registration
+        is_new_user = not resp.data or len(resp.data) == 0
+        
+        # Verify credentials with SRM portal
+        scraper_url = get_best_scraper()
+        if not scraper_url:
+            return jsonify({"success": False, "error": "No scraper servers available"}), 500
+            
+        # Call the login endpoint
+        login_response = requests.post(
+            f"{scraper_url}/api/login",
+            json={
+                "email": email,
+                "password": password
+            },
+            timeout=30
+        )
+        
+        if not login_response.ok or not login_response.json().get("success"):
+            # Could not login to SRM portal - credentials might be wrong
+            return jsonify({"success": False, "error": "Invalid SRM credentials"}), 401
+            
+        # Get cookies from login response
+        cookies = login_response.json().get("cookies", {})
+        if not cookies:
+            return jsonify({"success": False, "error": "Failed to get cookies from SRM portal"}), 500
+        
+        # If new user, create account
+        if is_new_user:
+            # Create user in database
+            new_user = supabase.table("users").insert({
+                "email": email,
+                "password": password,  # Store for future use
+                # Use name from email temporarily
+                "name": email.split("@")[0],
+                "created_at": datetime.utcnow().isoformat(),
+                "updated_at": datetime.utcnow().isoformat()
+            }).execute()
+            
+            if not new_user.data:
+                return jsonify({"success": False, "error": "Failed to create user"}), 500
+                
+            user = new_user.data[0]
+            
+            # For new users, use the combined scraper to get all data at once
+            print(f"New user {email} - calling combined scraper")
+            requests.post(
+                f"{scraper_url}/api/scrape-all",
+                json={
                     "email": email,
-                    "password_hash": generate_password_hash(password, method='pbkdf2:sha256'),
-                    "registration_number": ""
-                }
-                insert_resp = supabase.table("users").insert(new_user).execute()
-                if not insert_resp.data:
-                    raise Exception("Failed to create user record")
-                user = insert_resp.data[0]
-            else:
-                user = resp.data[0]
-                try:
-                    # Try to verify with existing hash
-                    if not check_password_hash(user["password_hash"], password):
-                        # If verification fails, update to new hash
-                        new_hash = generate_password_hash(password, method='pbkdf2:sha256')
-                        update_resp = supabase.table("users").update({"password_hash": new_hash}).eq("id", user["id"]).execute()
-                        if not update_resp.data:
-                            raise Exception("Failed to update password hash")
-                        user = update_resp.data[0]
-                except ValueError as e:
-                    if "unsupported hash type" in str(e):
-                        # If old hash is incompatible, update to new hash
-                        new_hash = generate_password_hash(password, method='pbkdf2:sha256')
-                        update_resp = supabase.table("users").update({"password_hash": new_hash}).eq("id", user["id"]).execute()
-                        if not update_resp.data:
-                            raise Exception("Failed to update password hash")
-                        user = update_resp.data[0]
-                    else:
-                        raise
-        except Exception as e:
-            print(f"Database error during user lookup/creation: {e}")
-            return jsonify({"success": False, "error": "Database operation failed"}), 500
-
-        # 4) Generate token with user["id"]
+                    "cookies": cookies
+                },
+                timeout=10
+            )
+            
+        else:
+            # Existing user
+            user = resp.data[0]
+            
+            # Update password in database
+            supabase.table("users").update({
+                "password": password,
+                "updated_at": datetime.utcnow().isoformat()
+            }).eq("id", user["id"]).execute()
+        
+        # Store cookies for future use
+        cookie_data = {
+            'email': email,
+            'cookies': cookies,
+            'token': str(datetime.utcnow().timestamp()),
+            'updated_at': datetime.utcnow().isoformat()
+        }
+        
+        # Delete existing cookie record if any
+        supabase.table('user_cookies').delete().eq('email', email).execute()
+        
+        # Store new cookies
+        supabase.table('user_cookies').insert(cookie_data).execute()
+        
+        # Create JWT token with 30 day expiration
         token = jwt.encode({
             "email": email,
             "id": user["id"],
             "exp": datetime.utcnow() + timedelta(days=30)
         }, os.getenv("JWT_SECRET", "default-secret-key"))
-
-        # 5) First, check if user already has timetable data
-        timetable_resp = supabase.table("timetable").select("*").eq("user_id", user["id"]).execute()
-        if not timetable_resp.data or len(timetable_resp.data) == 0:
-            # If no timetable data exists, we need to run timetable scraper first
-            print(f"No timetable data found for {email}, starting timetable scraper first")
-            # Start timetable scraper first
-            threading.Thread(
-                target=delayed_timetable_scraper,
-                args=(email, password, 0),  # No delay for first run
-                daemon=True
-            ).start()
+        
+        # Set initial status for the scraper
+        if is_new_user:
+            # For new users, set status to running for combined scraper
+            active_scrapers[email] = {
+                "status": "running", 
+                "started_at": datetime.utcnow().isoformat(),
+                "scraper_url": scraper_url
+            }
             
-            # Then start attendance scraper with a delay
+            # Start background thread to check completion
             threading.Thread(
-                target=async_scraper,
-                args=(email, password),
+                target=check_scraper_completion,
+                args=(email, user["id"], scraper_url),
                 daemon=True
             ).start()
-        else:
-            # If timetable data exists, just update attendance and marks
-            print(f"Timetable data exists for {email}, updating attendance only")
-            threading.Thread(
-                target=async_scraper,
-                args=(email, password),
-                daemon=True
-            ).start()
-
+        
         return jsonify({
-            "success": True,
-            "token": token,
-            "user": {"email": email, "id": user["id"]}
+            "success": True, 
+            "token": token, 
+            "user_id": user["id"],
+            "name": user.get("name", email.split("@")[0])
         })
-
+        
     except Exception as e:
         print(f"Login error: {e}")
+        import traceback
+        traceback.print_exc()
         return jsonify({"success": False, "error": str(e)}), 500
 
 @app.route("/api/attendance", methods=["GET", "OPTIONS"])
