@@ -1114,7 +1114,50 @@ def schema_check():
         admin_supabase = create_client(SUPABASE_URL, admin_key, options=admin_options)
         
         # Execute the function creation
-        admin_supabase.rpc('exec_sql', {'sql': create_utility_functions}).execute()
+        try:
+            admin_supabase.rpc('exec_sql', {'sql': create_utility_functions}).execute()
+        except Exception as sql_error:
+            # If the exec_sql function doesn't exist yet, create it
+            if "function exec_sql" in str(sql_error).lower() and "does not exist" in str(sql_error).lower():
+                # Create the exec_sql function first
+                create_exec_sql = """
+                CREATE OR REPLACE FUNCTION exec_sql(sql text) RETURNS void AS $$
+                BEGIN
+                    EXECUTE sql;
+                END;
+                $$ LANGUAGE plpgsql SECURITY DEFINER;
+                
+                GRANT EXECUTE ON FUNCTION exec_sql TO authenticated;
+                """
+                
+                # Execute raw SQL to create the function
+                try:
+                    # This direct execution requires full admin privileges
+                    response = requests.post(
+                        f"{SUPABASE_URL}/rest/v1/rpc/exec_sql",
+                        headers={
+                            "apikey": admin_key,
+                            "Authorization": f"Bearer {admin_key}",
+                            "Content-Type": "application/json"
+                        },
+                        json={"sql": create_exec_sql}
+                    )
+                    
+                    if not response.ok:
+                        print(f"Failed to create exec_sql function: {response.status_code} {response.text}")
+                        return jsonify({
+                            "success": False,
+                            "error": f"Failed to create exec_sql function: {response.status_code}"
+                        }), 500
+                        
+                    # Now try to create the utility function again
+                    admin_supabase.rpc('exec_sql', {'sql': create_utility_functions}).execute()
+                except Exception as direct_error:
+                    print(f"Error creating exec_sql function: {direct_error}")
+                    return jsonify({
+                        "success": False,
+                        "error": f"Error creating SQL utility functions: {direct_error}"
+                    }), 500
         
         # Now add the missing columns
         fixes = [
@@ -1135,6 +1178,48 @@ def schema_check():
                 results[fix] = "Success"
             except Exception as e:
                 results[fix] = f"Error: {str(e)}"
+                
+        # Create a trigger for updated_at if it doesn't exist
+        try:
+            create_trigger = """
+            -- Create update function if it doesn't exist 
+            CREATE OR REPLACE FUNCTION update_updated_at_column()
+            RETURNS TRIGGER AS $$
+            BEGIN
+                NEW.updated_at = CURRENT_TIMESTAMP;
+                RETURN NEW;
+            END;
+            $$ LANGUAGE plpgsql;
+            
+            -- Drop and recreate trigger
+            DROP TRIGGER IF EXISTS update_users_updated_at ON users;
+            CREATE TRIGGER update_users_updated_at
+            BEFORE UPDATE ON users
+            FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
+            """
+            
+            result = admin_supabase.rpc('exec_sql', {'sql': create_trigger}).execute()
+            results["create_trigger"] = "Success"
+        except Exception as trigger_error:
+            results["create_trigger"] = f"Error: {str(trigger_error)}"
+            
+        # Create scraper_status table if it doesn't exist
+        try:
+            create_status_table = """
+            CREATE TABLE IF NOT EXISTS scraper_status (
+                id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+                user_id UUID REFERENCES users(id),
+                status TEXT NOT NULL,
+                details JSONB,
+                created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+            );
+            """
+            
+            result = admin_supabase.rpc('exec_sql', {'sql': create_status_table}).execute()
+            results["create_status_table"] = "Success"
+        except Exception as table_error:
+            results["create_status_table"] = f"Error: {str(table_error)}"
         
         return jsonify({
             "success": True,
@@ -1143,6 +1228,8 @@ def schema_check():
         })
     
     except Exception as e:
+        import traceback
+        traceback.print_exc()
         return jsonify({
             "success": False,
             "error": str(e)
