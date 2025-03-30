@@ -1235,6 +1235,16 @@ def schema_check():
             "error": str(e)
         }), 500
 
+@app.route("/api/debug/scraper-selection", methods=["GET"])
+def debug_scraper_selection():
+    selected_url = get_best_scraper()
+    all_urls = get_scraper_urls()
+    return jsonify({
+        "selected_scraper": selected_url,
+        "all_scrapers": all_urls,
+        "selection_time": datetime.utcnow().isoformat()
+    })
+
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
     print(f"Starting server on port {port}...")
