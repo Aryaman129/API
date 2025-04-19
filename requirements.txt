@@ -15,9 +15,11 @@ python-dotenv>=0.19.0
 selenium>=4.0.0
 beautifulsoup4>=4.9.3
 supabase>=1.0.3
-webdriver-manager>=4.0.0 
+webdriver-manager>=4.0.0
 undetected-chromedriver>=3.1.0
-
-
-
- 
+Flask-SocketIO>=5.0.1
+python-socketio>=5.0.4
+python-engineio>=4.0.0
+eventlet>=0.30.2
+pytz>=2021.1
+requests>=2.25.1
