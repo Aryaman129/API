@@ -1731,16 +1731,6 @@ def schema_check():
             "error": str(e)
         }), 500
 
-@app.route("/api/debug/scraper-selection", methods=["GET"])
-def debug_scraper_selection():
-    selected_url = get_best_scraper()
-    all_urls = get_scraper_urls()
-    return jsonify({
-        "selected_scraper": selected_url,
-        "all_scrapers": all_urls,
-        "selection_time": get_ist_now().isoformat()
-    })
-
 @app.route("/api/data-status", methods=["GET", "OPTIONS"])
 def get_data_status():
     """Unified endpoint to check the status of all data types (timetable, attendance, marks)"""
